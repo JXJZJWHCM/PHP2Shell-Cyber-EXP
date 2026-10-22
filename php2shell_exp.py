@@ -58,6 +58,8 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 # 常量 / 字典
 # ---------------------------------------------------------------------------
 
+__version__ = "V1.0.1"   # 统一更新版本（见 CHANGELOG.md：V1.0.0 初版 + V1.0.1）
+
 FIXED = {"8.5": (8, 5, 12), "8.4": (8, 4, 27), "8.3": (8, 3, 36), "8.2": (8, 2, 35)}
 # 5.4~8.1 为 EOL 分支：官方 2026-10-21 仅对受支持的 8.2/8.3/8.4/8.5 出补丁，
 # EOL 分支无官方修复、永久受影响（advisory 明示）
@@ -1457,7 +1459,8 @@ def add_bypass_args(sp) -> None:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="php2shell 全自动化 EXP（WAF 绕过强化版）")
+    p = argparse.ArgumentParser(
+        description="php2shell 全自动化 EXP（WAF 绕过强化版） %s" % __version__)
     sub = p.add_subparsers(dest="mode", required=True)
 
     pa = sub.add_parser("auto", help="全自动流水线（零交互，持续测试）")

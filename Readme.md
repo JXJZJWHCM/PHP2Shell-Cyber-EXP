@@ -1,5 +1,7 @@
 # php2shell_exp.py — 武器化 EXP 使用说明
 
+**当前版本：V1.0.1**（统一更新版；版本历史见 [CHANGELOG.md](CHANGELOG.md)）
+
 CVE-2026-109618 / CVE-2026-109619（PHP2Shell）全自动化武器化利用工具 · WAF 对抗强化版
 Python 3.8+ · 纯标准库 · 零依赖 · 零交互 · 支持 CMD / CLI / PowerShell / Agent 一键调用
 
@@ -29,14 +31,28 @@ python php2shell_exp.py auto https://TARGET/ --flag-cmd "echo hello word > flag.
 
 自动完成：防御识别 → 策略选择 → WAF 绕过 → 利用 → flag 落地 → 回显验证 → 停火 → JSONL 报告。
 
-## 2. 攻击面与影响版本
+## 2. 攻击面与支持版本
 
 - 触发点：`php_session_rfc1867_callback`（ext/session/session.c），multipart POST 到 PHP SAPI。
-- **影响版本：PHP 5.4.0 – 8.5.11**；修复版本（2026-10-21，仅受支持分支）：8.5.12 / 8.4.27 / 8.3.36 / 8.2.35。
-  **5.4~8.1 为 EOL 分支，官方无修复、永久受影响。**
+
+### 2.1 EXP 支持攻击的 PHP 版本
+
+| PHP 版本 | EXP 攻击能力 | 实测证据 |
+| --- | --- | --- |
+| **7.4.33 / 8.0.30 / 8.1.33**（EOL 分支末位版本） | ✅ **一键 RCE**（hijack 链） | 官方正式版全通过（[TEST_REPORT.md](TEST_REPORT.md) §8） |
+| **8.2.34 / 8.3.35**（受支持分支受影响段末位） | ✅ **一键 RCE** | 官方正式版全通过 |
+| **8.4.26 / 8.5.11**（vs17 工具集新分支） | ✅ **一键 RCE** | 官方正式版全通过 |
+| 5.4.0 – 7.3.x（更早分支） | ✅ 机制同一（同一 hijack 链） | 载荷语法自 PHP 5.2.1+/7.2+ 生效，未逐一部署 |
+| **8.2.35 / 8.3.36 / 8.4.27 / 8.5.12**（修复版） | ⚠️ 主链关闭（rfc1867 期实例化 + serializer 泄漏）；**per-directory 混淆链仍可利用** | 8.2.35 对照实测（TEST_REPORT §7 R7） |
+
+- **影响范围：PHP 5.4.0 – 8.5.11**；修复版本（2026-10-21，仅受支持分支）：8.5.12 / 8.4.27 /
+  8.3.36 / 8.2.35。**5.4~8.1 为 EOL 分支，官方无修复、永久受影响。**
+- **链路硬前提**（缺一则链不成立）：`session.upload_progress.cleanup=Off` + seed 目录
+  `session.serialize_handler=php_serialize` / trigger 目录默认 `php` 的**目录级不一致**
+  （完整前提清单见 [RESEARCH.md](RESEARCH.md) §5）。
 - 载荷兼容性：`O:+N:`（长度 `+` 号）与 `S:` 十六进制转义（PHP 5.2.1+）经公开 WP/取证验证语义成立 —— **PHP 7.4 全兼容**。
-- **实测覆盖（官方正式版，一键通杀全通过）**：7.4.33 / 8.0.30 / 8.1.33 / 8.2.34 / 8.3.35 /
-  8.4.26 / 8.5.11（+8.2.35 补丁版对照），证据见 [TEST_REPORT.md](TEST_REPORT.md) §7-§8。
+- 实测一键通杀（单条 `auto` 命令 → `rce_confirmed` + flag 落地）：7.4.33 / 8.0.30 / 8.1.33 /
+  8.2.34 / 8.3.35 / 8.4.26 / 8.5.11 共 **7/7 版本全通过**，证据见 [TEST_REPORT.md](TEST_REPORT.md) §7-§8。
 
 ## 3. 子命令
 
@@ -95,6 +111,8 @@ python php2shell_exp.py shell https://TARGET/ --seed-path /SEED_PATH --trigger-p
 | `--jitter` | 2.0 | 射击间拟人抖动基数秒（行为/ML 对抗，触顶自动退避 ×1.5≤30s） |
 | `--variant` | 全部 | `pipe_object`（\|前缀+强制失败尾，默认）/ `pipe_clean`（公开 PoC 原始格式）子集 |
 | `--seed-mode` | full | **full=完整发送（默认；需 `cleanup=Off`——官方实测唯一可靠持久化路径）** / abort=在途窗口实验模式（官方 8.2.34 实测会话仅在解析完成时写盘，上传中窗口不存在；详见 TEST_REPORT §7） |
+| `--seed-url` | — | 投毒端点完整 URL（handler 混淆链可与触发端点分属不同 vhost/端口实例） |
+| `--trigger-url` | — | 触发端点完整 URL（与 `--seed-url` 配对使用） |
 
 ### 4.3 利用与后续操作
 

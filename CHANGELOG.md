@@ -49,6 +49,12 @@
 | **全版本真实矩阵（7.4.33/8.0.30/8.1.33/8.2.34/8.3.35/8.4.26/8.5.11）** | **23/23**（7/7 一键通杀+flag 落地） |
 | **稳定 shell 通道** | 自动建链（gadget/prop/sep/端点全自发现）· 3+5 命令全回显 · stderr 归并 · Agent JSON |
 
+### 发布
+- 文档按最终代码全面精确化：README 增补 **EXP 支持攻击的 PHP 版本矩阵** 与版本号 V1.0.1；
+  参数表与 argparse 逐项对齐（含 `--seed-url/--trigger-url`/`--json`/`--uaf-size-mb` 等）；
+  脚本内置 `__version__ = "V1.0.1"`。
+- GitHub Release：`v1.0.1`（tag + Release Notes）。
+
 ---
 
 ## [V1.0.0] - 2026-10-21
